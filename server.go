@@ -1,26 +1,55 @@
 package matrix
 
 import (
-	"errors"
 	"io"
 	"net"
+	"net/http"
 	"sync"
+	"time"
 
+	"github.com/mailgun/holster/v3/setter"
 	"github.com/sirupsen/logrus"
 )
 
 type ServerConfig struct {
 	// The address the server will listen on for incoming tcp connections
 	ListenAddress string
+
+	// ReadTimeout is the maximum duration for reading the entire
+	// request, including the body. Does not let Handlers make
+	// per-request read timeouts
+	ReadTimeout time.Duration
+
+	// WriteTimeout is the maximum duration before timing out
+	// writes of the response. It is reset whenever a new
+	// request's header is read. Like ReadTimeout, it does not
+	// let Handlers make decisions on a per-request basis.
+	ReadHeaderTimeout time.Duration
+
+	// WriteTimeout is the maximum duration before timing out
+	// writes of the response. It is reset whenever a new
+	// request's header is read. Like ReadTimeout, it does not
+	// let Handlers make decisions on a per-request basis.
+	WriteTimeout time.Duration
+
+	// IdleTimeout is the maximum amount of time to wait for the
+	// next request when keep-alives are enabled. If IdleTimeout
+	// is zero, the value of ReadTimeout is used. If both are
+	// zero, there is no timeout.
+	IdleTimeout time.Duration
+
+	Log logrus.FieldLogger
 }
 
 type server struct {
 	conf     ServerConfig
 	listener net.Listener
 	wg       sync.WaitGroup
+	srv      http.Server
 }
 
 func SpawnServer(conf ServerConfig) (io.Closer, error) {
+	setter.SetDefault(&conf.Log, logrus.WithField("category", "server"))
 	s := server{conf: conf}
 	var err error
 
@@ -30,45 +59,24 @@ func SpawnServer(conf ServerConfig) (io.Closer, error) {
 		return nil, err
 	}
 
-	// Main accept loop
+	s.srv = http.Server{
+		Handler:      &s,
+		ReadTimeout:  conf.ReadTimeout,
+		WriteTimeout: conf.WriteTimeout,
+		IdleTimeout:  conf.IdleTimeout,
+		// TODO: Ensure all logging is done under logrus
+		//ErrorLog:        nil,
+	}
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		var id uint64
-
-		for {
-			// Wait for new connections
-			conn, err := s.listener.Accept()
-			if err != nil {
-				// Listener temporary errors
-				if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-					logrus.WithError(err).Warn("temporary listener error")
-					continue
-				}
-
-				// Listener was closed
-				if errors.Unwrap(err).Error() == "use of closed network connection" {
-					return
-				}
-
-				logrus.WithError(err).Error("network error; closing")
-				return
+		if err := s.srv.Serve(s.listener); err != nil {
+			if err != http.ErrServerClosed {
+				s.conf.Log.WithError(err).Error("while running http.Serve()")
 			}
-
-			// Add to the work group and increment our id count
-			s.wg.Add(1)
-			id++
-
-			// Spawn a new go routine to handle the connection
-			go func(id uint64) {
-				defer s.wg.Done()
-				if err := s.handleConn(id, conn); err != nil {
-					logrus.WithError(err).Error("internal error; internal error")
-				}
-			}(id)
 		}
 	}()
-
 	return &s, nil
 }
 
@@ -80,10 +88,9 @@ func (s *server) Close() error {
 	return nil
 }
 
-func (s *server) handleConn(id uint64, conn net.Conn) error {
-	logrus.WithField("id", id).Infof("New connection (%s)", conn.RemoteAddr())
-	if _, err := conn.Write([]byte("Welcome to the matrix\r\n")); err != nil {
-		return err
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.conf.Log.Infof("New connection from '%s'", r.RemoteAddr)
+	if _, err := w.Write([]byte("Welcome to the matrix\r\n")); err != nil {
+		s.conf.Log.WithError(err).Error("while writing to client")
 	}
-	return conn.Close()
 }
